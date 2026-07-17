@@ -1,5 +1,6 @@
 # Build output
 /build/
+/cmake/
 
 # IDE / CMake user files
 .vs/

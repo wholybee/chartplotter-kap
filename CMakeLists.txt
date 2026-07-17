@@ -87,3 +87,144 @@ if(BUILD_KAP_TESTS)
         "${CHARTPLOTTER_SDK_DIR}")
     target_link_libraries(test_kap PRIVATE Qt6::Core Qt6::Gui)
 endif()
+
+# ---- install rules (used by the NSIS installer, and by `cmake --install`) ----
+#
+# The installer overlays an existing host installation, so its layout is relative
+# to the host's install root ($PROGRAMFILES64\HMV Chartplotter on Windows):
+#
+#   plugins/chartplotter_kap_plugin.dll   the loadable module (QPluginLoader)
+#
+# A MODULE library is a LIBRARY artifact on every platform (including the .dll on
+# Windows), so LIBRARY is the destination that matters; RUNTIME is named too for
+# belt-and-suspenders across CMake versions.
+install(TARGETS kap_plugin
+        LIBRARY DESTINATION "plugins"
+        RUNTIME DESTINATION "plugins")
+
+# Bundling Qt DLLs is OFF by default, on purpose. The host is a Qt Widgets
+# application, so it already ships Qt6Core.dll and Qt6Gui.dll (and the whole
+# windeployqt tree: platforms/, imageformats/, tls/, ...) next to its exe — this
+# plugin links nothing the host doesn't already provide (verified: every DLL
+# windeployqt lists for the plugin is present in the host deployment). Two
+# reasons not to ship them anyway:
+#   1. Redundant — the host's copies are already on the plugin's DLL search path
+#      (the plugin loads into the host process, which resolves Qt from its exe
+#      dir).
+#   2. Dangerous — if the plugin dropped its own Qt6Core.dll next to the host's
+#      and the user later uninstalled the PLUGIN, the plugin's uninstaller would
+#      delete a DLL the HOST needs, breaking the host. A plugin uninstaller must
+#      never remove host-owned files.
+# Turn this ON only for a host-less / self-contained deployment, where there is
+# no host Qt runtime to collide with. (The genuine "the plugin needs a Qt module
+# the host lacks" case — e.g. the CM93 plugin's Qt6Concurrent — is different:
+# there you bundle *only that one extra module*, which the host never had and so
+# is safe to remove on uninstall. List such modules in
+# CHARTPLOTTER_KAP_EXTRA_RUNTIME_DLLS below; for this plugin the set is empty.)
+option(CHARTPLOTTER_KAP_INSTALLER_BUNDLE_QT
+    "Bundle Qt6Core/Qt6Gui next to the host exe (host-less installs only; unsafe when a host is present)" OFF)
+if(WIN32 AND CHARTPLOTTER_KAP_INSTALLER_BUNDLE_QT)
+    install(FILES "$<TARGET_FILE:Qt6::Core>" "$<TARGET_FILE:Qt6::Gui>"
+            DESTINATION "." CONFIGURATIONS Release)
+endif()
+
+# Extra runtime DLLs to bundle into the install root — for the rare case where
+# the plugin links a Qt (or other) module the host does not deploy. Empty for
+# this plugin. Pass absolute paths, semicolon-separated:
+#   -DCHARTPLOTTER_KAP_EXTRA_RUNTIME_DLLS="C:/Qt/.../Qt6Foo.dll"
+set(CHARTPLOTTER_KAP_EXTRA_RUNTIME_DLLS "" CACHE STRING
+    "Absolute paths of extra runtime DLLs to install next to the host exe")
+if(WIN32 AND CHARTPLOTTER_KAP_EXTRA_RUNTIME_DLLS)
+    install(FILES ${CHARTPLOTTER_KAP_EXTRA_RUNTIME_DLLS}
+            DESTINATION "." CONFIGURATIONS Release)
+endif()
+
+# ---- Packaging: Windows installer (CPack + NSIS) ----------------------------
+#
+# Wraps the plugin (and any bundled runtime DLLs) into a single NSIS installer
+# .exe that overlays an existing HMV Chartplotter installation: it drops the
+# module into <host>\plugins\ so QPluginLoader finds it on next launch.
+#
+# Usage — build Release first, then run cpack from the build dir:
+#
+#   cmake --build build/vs2022 --config Release
+#   cpack --config build/vs2022/CPackConfig.cmake -C Release -G NSIS
+#
+# (or just build Release: the `installer` target below folds cpack into the build)
+#
+# Requires NSIS (makensis) for the NSIS generator:
+#   https://nsis.sourceforge.io/Download   (zlib/libpng licence)
+# `cmake --install build/vs2022 --config Release --prefix <dir>` stages the same
+# payload without NSIS, which is handy for verifying it.
+#
+# The installer intentionally shares the host's install DIRECTORY (so plugins/
+# lands in the right place) but uses its OWN uninstaller name and Add/Remove
+# registry key, so it never clobbers the host's Uninstall.exe or its Add/Remove
+# entry. Uninstalling the plugin removes only the plugin's own files.
+if(WIN32)
+    set(CPACK_GENERATOR "NSIS")
+    # Emit the installer inside the build tree, not the caller's CWD.
+    set(CPACK_PACKAGE_DIRECTORY "${CMAKE_BINARY_DIR}/installer")
+
+    set(CPACK_PACKAGE_NAME            "HMV Chartplotter KAP Plugin")
+    set(CPACK_PACKAGE_VENDOR          "net.holybee")
+    set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "BSB/KAP raster chart plugin for HMV Chartplotter")
+    set(CPACK_PACKAGE_VERSION_MAJOR ${PROJECT_VERSION_MAJOR})
+    set(CPACK_PACKAGE_VERSION_MINOR ${PROJECT_VERSION_MINOR})
+    set(CPACK_PACKAGE_VERSION_PATCH ${PROJECT_VERSION_PATCH})
+    set(CPACK_PACKAGE_VERSION       "${PROJECT_VERSION}")
+    set(CPACK_PACKAGE_FILE_NAME     "chartplotter_kap_plugin-${PROJECT_VERSION}-win64")
+    set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/COPYING")
+
+    # Overlay the host: same Program Files subfolder as the host installer, so
+    # plugins/ ends up inside the host's directory. The NSIS directory page still
+    # lets the user browse elsewhere if their host lives in a non-default path.
+    set(CPACK_PACKAGE_INSTALL_DIRECTORY "HMV Chartplotter")
+    set(CPACK_NSIS_INSTALL_ROOT "$PROGRAMFILES64")
+
+    # Distinct identity so the plugin coexists with the host in Add/Remove and
+    # does NOT overwrite the host's uninstaller:
+    #  - a separate Add/Remove entry (own registry key, else it defaults off the
+    #    shared install directory and would collide with the host's key);
+    #  - its own uninstaller exe (default "Uninstall.exe" would clobber the
+    #    host's, hijacking the host's Add/Remove entry).
+    set(CPACK_PACKAGE_INSTALL_REGISTRY_KEY "HMV-Chartplotter-KAP-Plugin")
+    set(CPACK_NSIS_UNINSTALL_NAME          "Uninstall-KAP-Plugin")
+    set(CPACK_NSIS_DISPLAY_NAME "HMV Chartplotter — BSB/KAP Chart Plugin")
+    set(CPACK_NSIS_PACKAGE_NAME "HMV Chartplotter KAP Plugin")
+
+    # Clean plugin reinstall (removes a prior plugin install first — its own key,
+    # so it never touches the host). No PATH edits; it's just a couple of DLLs.
+    set(CPACK_NSIS_ENABLE_UNINSTALL_BEFORE_INSTALL ON)
+    set(CPACK_NSIS_MODIFY_PATH OFF)
+    # No Start-menu/desktop shortcuts: a plugin has nothing to launch.
+
+    include(CPack)
+
+    # ---- Auto-build the NSIS installer as part of a Release build ------------
+    #
+    # Mirrors the host: fold `cpack ... -G NSIS` into the normal build so the
+    # installer is produced without a separate command. Gated to MULTI-CONFIG
+    # generators (Visual Studio / MSVC) — the CONFIGURATIONS Release install
+    # rules above assume that, and CI (Ninja/MinGW, single-config, no makensis)
+    # sets no CMAKE_CONFIGURATION_TYPES, so the target is simply absent there.
+    # pack_release.cmake no-ops for non-Release configs. Turn off with
+    # -DCHARTPLOTTER_KAP_BUILD_INSTALLER=OFF.
+    option(CHARTPLOTTER_KAP_BUILD_INSTALLER
+        "Auto-build the NSIS installer during a multi-config Release build" ON)
+    if(CHARTPLOTTER_KAP_BUILD_INSTALLER AND CMAKE_CONFIGURATION_TYPES)
+        add_custom_target(kap_installer ALL
+            COMMAND ${CMAKE_COMMAND}
+                    -DCFG=$<CONFIG>
+                    -DCPACK_CMD=${CMAKE_CPACK_COMMAND}
+                    -DCPACK_CONFIG=${CMAKE_BINARY_DIR}/CPackConfig.cmake
+                    -DBIN_DIR=${CMAKE_BINARY_DIR}
+                    -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/pack_release.cmake
+            WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+            COMMENT "Packaging NSIS installer (Release only)"
+            VERBATIM
+        )
+        # Order after the plugin so its DLL is built before cpack stages it.
+        add_dependencies(kap_installer kap_plugin)
+    endif()
+endif()

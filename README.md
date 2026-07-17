@@ -71,6 +71,49 @@ cmake --preset vs2022 -DCHARTPLOTTER_APP_DIR="C:/path/to/app"   # folder with hm
 copy it there by hand; the host scans `plugins/` next to the executable
 (`Contents/PlugIns` on macOS).
 
+## Windows installer (NSIS)
+
+A multi-config **MSVC/Visual Studio** Release build also produces an NSIS
+installer, the same way the host application project does — no extra command:
+
+```sh
+cmake --preset vs2022
+cmake --build build/vs2022 --config Release
+# -> build/vs2022/installer/chartplotter_kap_plugin-<version>-win64.exe
+```
+
+It needs [NSIS](https://nsis.sourceforge.io/Download) (`makensis`) installed. The
+installer overlays an existing HMV Chartplotter installation: it drops
+`chartplotter_kap_plugin.dll` into `<host>\plugins\`, so the host loads it on next
+launch. The directory page defaults to the host's default location
+(`%ProgramFiles%\HMV Chartplotter`) and lets you browse elsewhere if your host
+lives somewhere else.
+
+It coexists cleanly with the host: its own Add/Remove Programs entry, its own
+uninstaller (`Uninstall-KAP-Plugin.exe`, so it never overwrites the host's
+`Uninstall.exe`), and it removes only its own file on uninstall.
+
+**Qt DLLs are intentionally not bundled.** The host is a Qt application and
+already ships `Qt6Core.dll` / `Qt6Gui.dll` (and the rest of the Qt runtime) next
+to its exe — this plugin links nothing the host doesn't already provide. Shipping
+duplicates would be redundant, and worse: the plugin's uninstaller would then
+delete Qt DLLs the *host* depends on. For a host-less / self-contained layout,
+configure with `-DCHARTPLOTTER_KAP_INSTALLER_BUNDLE_QT=ON` to place `Qt6Core.dll`
+and `Qt6Gui.dll` in the install root as well. (This is separate from the rare case
+of a plugin needing a Qt module the host lacks — for that, list its DLL in
+`CHARTPLOTTER_KAP_EXTRA_RUNTIME_DLLS`.)
+
+The installer target is created only for multi-config generators (Visual Studio);
+the single-config MinGW/Ninja CI build does not build it (no `makensis` there),
+exactly as in the host project. Disable it with
+`-DCHARTPLOTTER_KAP_BUILD_INSTALLER=OFF`.
+
+To stage the same payload without NSIS (to inspect it):
+
+```sh
+cmake --install build/vs2022 --config Release --prefix some/dir
+```
+
 ## Smoke test
 
 `test_kap` exercises the reader against a real chart folder with no GUI and no
