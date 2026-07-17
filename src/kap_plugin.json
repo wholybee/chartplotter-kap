@@ -1,0 +1,7 @@
+{
+    "id": "kap-plugin",
+    "name": "BSB/KAP Charts",
+    "version": "0.1",
+    "apiVersion": 5,
+    "description": "Reads BSB/KAP 2.0 raster charts and serves them to the chart pipeline as map tiles, alongside the built-in MBTiles raster layer. Mercator, north-up charts only. GPL-2.0-or-later."
+}

@@ -1,0 +1,467 @@
+name: build
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # Basename of the built module (CMake OUTPUT_NAME, PREFIX ""), so the file is
+  # chartplotter_kap_plugin.so / .dll with no "lib" prefix on either platform.
+  PLUGIN_NAME: chartplotter_kap_plugin
+  PKG_NAME: wholybee-chartplotter-kap
+  # The host package. Its .deb lays out /usr/lib/wholybee-chartplotter/plugins/,
+  # which is where QPluginLoader picks this module up, so both the install path
+  # below and the Recommends: field key off this name.
+  HOST_PKG: wholybee-chartplotter
+  BUILD_TYPE: Release
+
+jobs:
+  linux:
+    name: linux (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    # Built in a Debian Trixie container to match the host's own CI: a plugin
+    # must be ABI-compatible with the Qt 6 the host was linked against, and
+    # Trixie ships Qt 6.8 where the stock Ubuntu runners still ship Qt 6.4.
+    # GitHub falls back to /bin/sh for container jobs, so force bash for the
+    # bash-only syntax used below.
+    container: debian:trixie
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: amd64
+            runner: ubuntu-latest
+          - name: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Install dependencies
+        run: |
+          set -eux
+          apt-get update
+          # Qt6 Core/Gui both live in qt6-base-dev. Unlike the host, this plugin
+          # needs no GDAL, shadertools, websockets or multimedia, and unlike the
+          # CM93 plugin it needs no Concurrent -- it links Qt Core + Gui only
+          # (see CMakeLists.txt).
+          apt-get install -y \
+            ca-certificates git \
+            cmake ninja-build g++ pkg-config \
+            qt6-base-dev qt6-base-dev-tools \
+            dpkg-dev fakeroot apt-utils
+
+      - uses: actions/checkout@v4
+
+      - name: Compute artifact tag
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "ARTIFACT_TAG=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+            echo "DEB_VERSION=${GITHUB_REF_NAME#v}-1" >> "$GITHUB_ENV"
+          else
+            echo "ARTIFACT_TAG=sha-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+            echo "DEB_VERSION=0.0.0+sha${GITHUB_SHA::7}-1" >> "$GITHUB_ENV"
+          fi
+          echo "DEB_ARCH=$(dpkg --print-architecture)" >> "$GITHUB_ENV"
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+
+      - name: Build
+        run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
+
+      - name: Verify build outputs
+        run: |
+          set -euo pipefail
+          ls -l build
+          # Single-config Ninja puts these top-level targets in the build root.
+          # The packaging steps hardcode those paths, so assert them here: a
+          # layout change should fail with this message rather than a bare
+          # "install: cannot stat" further down.
+          test -f "build/${PLUGIN_NAME}.so"
+          test -f build/test_kap
+
+      - name: Package portable tarball
+        run: |
+          set -euo pipefail
+          ARCH="${{ matrix.name }}"
+          DIST="dist/${PKG_NAME}-${ARTIFACT_TAG}-linux-${ARCH}"
+          rm -rf dist
+          install -d "$DIST/plugins"
+
+          # Mirrors the host's layout: the module goes in plugins/ next to the
+          # host binary, so the tarball can be unpacked straight over an install.
+          install -m 0755 "build/${PLUGIN_NAME}.so" "$DIST/plugins/${PLUGIN_NAME}.so"
+          # GUI-free reader check; needs Qt6Core/Qt6Gui at runtime, which the
+          # host install already provides.
+          install -m 0755 build/test_kap "$DIST/test_kap"
+          install -m 0644 README.md "$DIST/README.md"
+          install -m 0644 COPYING "$DIST/COPYING"
+
+          tar -czf "${PKG_NAME}-${ARTIFACT_TAG}-linux-${ARCH}.tar.gz" -C "dist" "${PKG_NAME}-${ARTIFACT_TAG}-linux-${ARCH}"
+
+      - name: Package Debian .deb
+        run: |
+          set -euo pipefail
+          PKG="${PKG_NAME}"
+          STAGE="debian/${PKG}"
+
+          rm -rf debian
+          install -d \
+            "$STAGE/DEBIAN" \
+            "$STAGE/usr/lib/${HOST_PKG}/plugins" \
+            "$STAGE/usr/share/doc/${PKG}"
+
+          # Drop the module into the *host* package's plugin folder. This is the
+          # only payload: the plugin is loaded by the host, it has no standalone
+          # entry point of its own.
+          install -m 0644 "build/${PLUGIN_NAME}.so" \
+            "$STAGE/usr/lib/${HOST_PKG}/plugins/${PLUGIN_NAME}.so"
+          install -m 0644 README.md "$STAGE/usr/share/doc/${PKG}/README.md"
+          install -m 0644 COPYING "$STAGE/usr/share/doc/${PKG}/copyright"
+
+          SIZE_KB="$(du -sk "$STAGE/usr" | awk '{print $1}')"
+
+          # dpkg-shlibdeps reads the source package's debian/control by default.
+          cat > debian/control <<CONTROL
+          Source: ${PKG}
+          Section: utils
+          Priority: optional
+          Maintainer: ${GITHUB_REPOSITORY} <noreply@github.com>
+          Standards-Version: 4.6.2
+
+          Package: ${PKG}
+          Architecture: any
+          Depends: \${shlibs:Depends}, \${misc:Depends}
+          Description: BSB/KAP raster chart plugin for HMV Chartplotter
+           Reads BSB/KAP 2.0 raster charts.
+          CONTROL
+
+          DEPENDS="$(dpkg-shlibdeps --ignore-missing-info -O -p"${PKG}" \
+            -S"$STAGE" \
+            -e"$STAGE/usr/lib/${HOST_PKG}/plugins/${PLUGIN_NAME}.so" \
+            | sed -n 's/^shlibs:Depends=//p')"
+          [ -n "$DEPENDS" ] || DEPENDS="libc6"
+
+          cat > "$STAGE/DEBIAN/control" <<CONTROL
+          Package: ${PKG}
+          Version: ${DEB_VERSION}
+          Section: utils
+          Priority: optional
+          Architecture: ${DEB_ARCH}
+          Maintainer: ${GITHUB_REPOSITORY} <noreply@github.com>
+          Depends: ${DEPENDS}
+          Recommends: ${HOST_PKG}
+          Installed-Size: ${SIZE_KB}
+          Homepage: https://github.com/${GITHUB_REPOSITORY}
+          Description: BSB/KAP raster chart plugin for HMV Chartplotter
+           Reads BSB/KAP 2.0 raster charts and serves them to HMV Chartplotter
+           through the host's IRasterChartSource plugin interface, so KAP charts
+           flow through the same tile pyramid, cache and GPU path as the built-in
+           MBTiles raster layer.
+           .
+           Mercator north-up charts only; other projections are declined rather
+           than mis-placed.
+           .
+           Loaded at runtime via QPluginLoader; the host links none of this code.
+          CONTROL
+
+          fakeroot dpkg-deb --build "$STAGE" "${PKG}_${DEB_VERSION}_${DEB_ARCH}.deb"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.name }}
+          path: |
+            ${{ env.PKG_NAME }}-${{ env.ARTIFACT_TAG }}-linux-${{ matrix.name }}.tar.gz
+            ${{ env.PKG_NAME }}_${{ env.DEB_VERSION }}_${{ env.DEB_ARCH }}.deb
+
+  windows:
+    name: windows (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    # MSYS2/MinGW, not the MSVC toolchain in CMakePresets.json: the host's own
+    # CI publishes MinGW builds, and a Qt plugin only loads into a host built
+    # with a matching C++ ABI. Use the vs2022 preset locally against a locally
+    # built MSVC host; these artifacts pair with the host's CI artifacts.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x64
+            runner: windows-latest
+            msystem: MINGW64
+            prefix: mingw-w64-x86_64
+          - name: arm64
+            runner: windows-11-arm
+            msystem: CLANGARM64
+            prefix: mingw-w64-clang-aarch64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSYS2 (${{ matrix.msystem }})
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.msystem }}
+          update: true
+          install: >-
+            ${{ matrix.prefix }}-cc
+            ${{ matrix.prefix }}-cmake
+            ${{ matrix.prefix }}-ninja
+            ${{ matrix.prefix }}-qt6-base
+            git
+            p7zip
+
+      - name: Compute artifact tag
+        shell: msys2 {0}
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "ARTIFACT_TAG=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          else
+            echo "ARTIFACT_TAG=sha-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Configure
+        shell: msys2 {0}
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+
+      - name: Build
+        shell: msys2 {0}
+        run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
+
+      - name: Verify build outputs
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          ls -l build
+          # Single-config Ninja puts these top-level targets in the build root.
+          # The packaging step hardcodes those paths, so assert them here rather
+          # than failing later with a bare "cp: cannot stat".
+          test -f "build/${PLUGIN_NAME}.dll"
+          test -f build/test_kap.exe
+
+      - name: Package portable zip
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          ARCH="${{ matrix.name }}"
+          rm -rf dist "${PKG_NAME}-${ARTIFACT_TAG}-windows-${ARCH}.zip"
+          mkdir -p dist/plugins
+
+          # Laid out to be extracted straight over an installed host: the module
+          # into plugins/, everything else next to hmvchartplotter.exe.
+          cp -f "build/${PLUGIN_NAME}.dll" dist/plugins/
+          cp -f build/test_kap.exe dist/
+          cp -f README.md COPYING dist/
+
+          # No Qt DLLs travel with this plugin: it imports only Qt6Core and
+          # Qt6Gui, both of which the host already deploys. (The CM93 plugin has
+          # to ship Qt6Concurrent.dll because the host never deploys that one --
+          # this plugin doesn't link Concurrent, so the problem doesn't arise.)
+          # Deliberately do NOT ship the host's own Qt DLLs: overwriting them
+          # with a different Qt build could break the host itself.
+
+          7z a "${PKG_NAME}-${ARTIFACT_TAG}-windows-${ARCH}.zip" ./dist/*
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.name }}
+          path: ${{ env.PKG_NAME }}-${{ env.ARTIFACT_TAG }}-windows-${{ matrix.name }}.zip
+
+  # Build that actually runs on a Raspberry Pi (64-bit Debian Trixie / Pi OS
+  # Trixie), matching the host's debian-trixie job. Built inside a debian:trixie
+  # container -- natively on the aarch64 runner, no emulation -- so the module is
+  # matched to the Pi's glibc and Qt 6.8, and to the host .deb built the same way.
+  debian-trixie:
+    name: debian trixie (arm64 / Raspberry Pi)
+    runs-on: ubuntu-24.04-arm
+    container: debian:trixie
+    # The debian:trixie container has bash, but GitHub Actions falls back to
+    # /bin/sh (dash) for container jobs, which breaks the bash-only syntax used
+    # below ([[ ]], ${VAR::N}, set -o pipefail). Force bash for all steps.
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install dependencies
+        run: |
+          set -eux
+          apt-get update
+          apt-get install -y \
+            ca-certificates git \
+            cmake ninja-build g++ pkg-config \
+            qt6-base-dev qt6-base-dev-tools \
+            dpkg-dev fakeroot
+
+      - uses: actions/checkout@v4
+
+      - name: Compute artifact tag
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "ARTIFACT_TAG=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+            echo "DEB_VERSION=${GITHUB_REF_NAME#v}-1~trixie" >> "$GITHUB_ENV"
+          else
+            echo "ARTIFACT_TAG=sha-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+            echo "DEB_VERSION=0.0.0+sha${GITHUB_SHA::7}-1~trixie" >> "$GITHUB_ENV"
+          fi
+          echo "DEB_ARCH=$(dpkg --print-architecture)" >> "$GITHUB_ENV"
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+
+      - name: Build
+        run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
+
+      - name: Verify build outputs
+        run: |
+          set -euo pipefail
+          ls -l build
+          # Single-config Ninja puts these top-level targets in the build root.
+          # The packaging steps hardcode those paths, so assert them here.
+          test -f "build/${PLUGIN_NAME}.so"
+          test -f build/test_kap
+
+      - name: Package portable tarball
+        run: |
+          set -euo pipefail
+          DIST="dist/${PKG_NAME}-${ARTIFACT_TAG}-debian-trixie-arm64"
+          rm -rf dist
+          install -d "$DIST/plugins"
+
+          install -m 0755 "build/${PLUGIN_NAME}.so" "$DIST/plugins/${PLUGIN_NAME}.so"
+          install -m 0755 build/test_kap "$DIST/test_kap"
+          install -m 0644 README.md "$DIST/README.md"
+          install -m 0644 COPYING "$DIST/COPYING"
+
+          tar -czf "${PKG_NAME}-${ARTIFACT_TAG}-debian-trixie-arm64.tar.gz" -C "dist" "${PKG_NAME}-${ARTIFACT_TAG}-debian-trixie-arm64"
+
+      - name: Package Debian .deb
+        run: |
+          set -euo pipefail
+          PKG="${PKG_NAME}"
+          STAGE="debian/${PKG}"
+
+          rm -rf debian
+          install -d \
+            "$STAGE/DEBIAN" \
+            "$STAGE/usr/lib/${HOST_PKG}/plugins" \
+            "$STAGE/usr/share/doc/${PKG}"
+
+          install -m 0644 "build/${PLUGIN_NAME}.so" \
+            "$STAGE/usr/lib/${HOST_PKG}/plugins/${PLUGIN_NAME}.so"
+          install -m 0644 README.md "$STAGE/usr/share/doc/${PKG}/README.md"
+          install -m 0644 COPYING "$STAGE/usr/share/doc/${PKG}/copyright"
+
+          SIZE_KB="$(du -sk "$STAGE/usr" | awk '{print $1}')"
+
+          # dpkg-shlibdeps reads the source package's debian/control by default.
+          cat > debian/control <<CONTROL
+          Source: ${PKG}
+          Section: utils
+          Priority: optional
+          Maintainer: ${GITHUB_REPOSITORY} <noreply@github.com>
+          Standards-Version: 4.6.2
+
+          Package: ${PKG}
+          Architecture: any
+          Depends: \${shlibs:Depends}, \${misc:Depends}
+          Description: BSB/KAP raster chart plugin for HMV Chartplotter
+           Reads BSB/KAP 2.0 raster charts.
+          CONTROL
+
+          DEPENDS="$(dpkg-shlibdeps --ignore-missing-info -O -p"${PKG}" \
+            -S"$STAGE" \
+            -e"$STAGE/usr/lib/${HOST_PKG}/plugins/${PLUGIN_NAME}.so" \
+            | sed -n 's/^shlibs:Depends=//p')"
+          [ -n "$DEPENDS" ] || DEPENDS="libc6"
+
+          cat > "$STAGE/DEBIAN/control" <<CONTROL
+          Package: ${PKG}
+          Version: ${DEB_VERSION}
+          Section: utils
+          Priority: optional
+          Architecture: ${DEB_ARCH}
+          Maintainer: ${GITHUB_REPOSITORY} <noreply@github.com>
+          Depends: ${DEPENDS}
+          Recommends: ${HOST_PKG}
+          Installed-Size: ${SIZE_KB}
+          Homepage: https://github.com/${GITHUB_REPOSITORY}
+          Description: BSB/KAP raster chart plugin for HMV Chartplotter
+           Reads BSB/KAP 2.0 raster charts and serves them to HMV Chartplotter
+           through the host's IRasterChartSource plugin interface, so KAP charts
+           flow through the same tile pyramid, cache and GPU path as the built-in
+           MBTiles raster layer. Built on Debian Trixie for 64-bit Raspberry Pi /
+           Debian arm64.
+           .
+           Mercator north-up charts only; other projections are declined rather
+           than mis-placed.
+           .
+           Loaded at runtime via QPluginLoader; the host links none of this code.
+          CONTROL
+
+          fakeroot dpkg-deb --build "$STAGE" "${PKG}_${DEB_VERSION}_${DEB_ARCH}.deb"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: debian-trixie-arm64
+          path: |
+            ${{ env.PKG_NAME }}-${{ env.ARTIFACT_TAG }}-debian-trixie-arm64.tar.gz
+            ${{ env.PKG_NAME }}_${{ env.DEB_VERSION }}_${{ env.DEB_ARCH }}.deb
+
+  publish:
+    name: publish to GitHub Release (+ flat APT repo)
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, windows, debian-trixie]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Build flat APT repository (Packages/Release)
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y dpkg-dev apt-utils
+
+          rm -rf apt-repo
+          mkdir -p apt-repo
+          cp -v release-assets/linux-amd64/*.deb apt-repo/
+          cp -v release-assets/linux-arm64/*.deb apt-repo/
+
+          pushd apt-repo >/dev/null
+          dpkg-scanpackages --multiversion . /dev/null > Packages
+          gzip -9c Packages > Packages.gz
+          apt-ftparchive release . > Release
+          popd >/dev/null
+
+      - name: Publish versioned release (tag v*)
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-assets/linux-amd64/*.tar.gz
+            release-assets/linux-arm64/*.tar.gz
+            release-assets/debian-trixie-arm64/*
+            release-assets/windows-x64/*.zip
+            release-assets/windows-arm64/*.zip
+            apt-repo/*
+
+      - name: Publish/update stable APT release (tag "apt")
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apt
+          name: APT repository (stable)
+          target_commitish: ${{ github.sha }}
+          overwrite_files: true
+          files: |
+            apt-repo/*
