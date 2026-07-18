@@ -7,6 +7,7 @@
 #include <QImage>
 #include <QPointF>
 #include <QString>
+#include <cmath>
 #include <cstdint>
 #include <vector>
 
@@ -28,24 +29,43 @@
 // instead of the whole (often 2048 x 6144) image. Nothing here ever holds a full
 // decoded chart in memory.
 //
-// Georeferencing comes from the REF/ pixel<->lat/lon control points. For a
-// north-up Mercator chart — which is what KAP is overwhelmingly used for, and
-// the only kind this reader accepts — longitude is linear in x and *projected*
-// Mercator y is linear in y, so two independent linear fits place the chart
-// exactly. See parse() for the rejection rules.
-
-// Maps chart pixels <-> geography for a north-up Mercator chart.
-//   lon   = lonA  + lonB  * px
-//   mercY = mercC + mercD * py     (mercY = proj::latToY(lat), metres)
+// Georeferencing comes from the REF/ pixel<->lat/lon control points. A KAP is a
+// Mercator chart, but its raster is not necessarily north-up: BSB charts carry a
+// skew angle (KNP/SK) and NOAA in particular rotates approach and harbour charts
+// to run a channel or coastline up the page. In *projected* Mercator space that
+// rotation is an affine map, so both world axes depend on both pixel axes:
+//
+//   X = xA + xB*px + xC*py          X = proj::lonToX(lon)   (metres)
+//   Y = yA + yB*px + yC*py          Y = proj::latToY(lat)   (metres)
+//
+// A least-squares affine fit over the REF points places any skewed Mercator chart
+// exactly, and collapses to the separable north-up case (xC = yB = 0) on its own
+// when the chart isn't rotated. Only genuinely different projections (polyconic)
+// are declined — see parse().
 struct KapGeoref {
-    double lonA = 0.0, lonB = 0.0;
-    double mercC = 0.0, mercD = 0.0;
+    // Forward map, chart pixel -> Mercator metres.
+    double xA = 0.0, xB = 0.0, xC = 0.0;
+    double yA = 0.0, yB = 0.0, yC = 0.0;
+    // Determinant of the 2x2 linear part, cached by finalize() for the inverse
+    // and for the pixel scale. Zero means the fit was degenerate.
+    double det = 0.0;
 
-    double pxToLon(double px)    const { return lonA + lonB * px; }
-    double pyToMercY(double py)  const { return mercC + mercD * py; }
-    double lonToPx(double lon)   const { return (lon - lonA) / lonB; }
-    double mercYToPy(double m)   const { return (m - mercC) / mercD; }
-    bool   valid() const { return lonB != 0.0 && mercD != 0.0; }
+    void finalize() { det = xB * yC - xC * yB; }
+    bool valid() const { return det != 0.0; }
+
+    void pixelToWorld(double px, double py, double& X, double& Y) const {
+        X = xA + xB * px + xC * py;
+        Y = yA + yB * px + yC * py;
+    }
+    void worldToPixel(double X, double Y, double& px, double& py) const {
+        const double dx = X - xA, dy = Y - yA;
+        px = ( yC * dx - xC * dy) / det;
+        py = (-yB * dx + xB * dy) / det;
+    }
+    // Mercator metres spanned by one raster pixel (geometric mean of the two axis
+    // scales); for a conformal Mercator chart the axes are equal, so this is just
+    // the pixel size. Drives nativeZoom().
+    double metresPerPixel() const { return std::sqrt(std::abs(det)); }
 };
 
 // One parsed chart: immutable after parse(), so renderTile() is const and safe
@@ -54,8 +74,9 @@ class KapChart {
 public:
     // Parse the header and index table of `path`. Does not decode any imagery.
     // Returns false + err for unreadable files, and for charts this reader
-    // deliberately declines (see the projection/skew rules in the .cpp) — the
-    // caller should skip those rather than draw them in the wrong place.
+    // deliberately declines (a non-Mercator projection — see parse()) — the
+    // caller should skip those rather than draw them in the wrong place. Skewed
+    // (rotated) Mercator charts are supported, not declined.
     static bool parse(const QString& path, KapChart& out, QString& err);
 
     // Render the XYZ tile (z, x, y) — slippy-map convention, y = 0 north — into
@@ -83,9 +104,12 @@ public:
                       double& maxLon, double& maxLat) const;
 
 private:
-    // Decode source row `row` into `out` (palette indices, width_ entries).
-    // `f` is a file handle owned by the caller (one per renderTile call).
-    bool readRow(class QFile& f, int row, std::vector<uint8_t>& out) const;
+    // Decode source row `row` into `out` (palette indices, width_ entries), but
+    // stop once column `maxCol` is reached — a tile only needs the columns up to
+    // its right edge, and RLE rows must be decoded from the start, so this caps
+    // the wasted work at the tail. `f` is a file handle owned by the caller (one
+    // per renderTile call).
+    bool readRow(class QFile& f, int row, std::vector<uint8_t>& out, int maxCol) const;
 
     QString path_;
     QString name_;

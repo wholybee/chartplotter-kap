@@ -74,22 +74,52 @@ QHash<QString, QString> parseKv(const QString& value) {
     return kv;
 }
 
-// Least-squares fit of v = a + b*u over the control points. Returns false when
-// the u values are (near) coincident, i.e. the points don't constrain the axis.
-bool linearFit(const std::vector<double>& u, const std::vector<double>& v,
-               double& a, double& b) {
-    const int n = static_cast<int>(u.size());
-    if (n < 2) return false;
-    double su = 0, sv = 0, suu = 0, suv = 0;
+// Least-squares fit of the affine map (px,py) -> (X,Y):
+//   X = xA + xB*px + xC*py,   Y = yA + yB*px + yC*py
+// over the REF control points.
+//
+// Solved on coordinates centred at their means: centring decouples the constant
+// term (it becomes the mean of X / Y) and leaves a well-conditioned 2x2 covariance
+// system for the two slopes — pixel coordinates run into the tens of thousands, so
+// fitting them raw would lose precision and make a sane singularity test hard.
+// Returns false when the control points are collinear (they don't pin a 2-D
+// transform) or the resulting transform is degenerate.
+bool affineFit(const std::vector<double>& px, const std::vector<double>& py,
+               const std::vector<double>& X, const std::vector<double>& Y,
+               KapGeoref& g) {
+    const int n = static_cast<int>(px.size());
+    if (n < 3) return false;
+
+    double mpx = 0, mpy = 0, mX = 0, mY = 0;
+    for (int i = 0; i < n; ++i) { mpx += px[i]; mpy += py[i]; mX += X[i]; mY += Y[i]; }
+    mpx /= n; mpy /= n; mX /= n; mY /= n;
+
+    // Centred moments: Suu = Σ dpx², Svv = Σ dpy², Suv = Σ dpx·dpy, and the
+    // cross-products of each world axis with the centred pixel coordinates.
+    double Suu = 0, Svv = 0, Suv = 0;
+    double SuX = 0, SvX = 0, SuY = 0, SvY = 0;
     for (int i = 0; i < n; ++i) {
-        su += u[i]; sv += v[i];
-        suu += u[i] * u[i]; suv += u[i] * v[i];
+        const double u = px[i] - mpx, v = py[i] - mpy;
+        const double dX = X[i] - mX,  dY = Y[i] - mY;
+        Suu += u * u; Svv += v * v; Suv += u * v;
+        SuX += u * dX; SvX += v * dX;
+        SuY += u * dY; SvY += v * dY;
     }
-    const double denom = n * suu - su * su;
-    if (std::abs(denom) < 1e-9) return false;
-    b = (n * suv - su * sv) / denom;
-    a = (sv - b * su) / n;
-    return b != 0.0;
+    // Collinear control points give a rank-deficient covariance matrix; reject
+    // relative to its scale so the test is independent of chart size.
+    const double det2 = Suu * Svv - Suv * Suv;
+    if (det2 <= 1e-12 * Suu * Svv) return false;
+
+    // Slopes from the 2x2 solve, one right-hand side per world axis.
+    g.xB = ( Svv * SuX - Suv * SvX) / det2;
+    g.xC = (-Suv * SuX + Suu * SvX) / det2;
+    g.yB = ( Svv * SuY - Suv * SvY) / det2;
+    g.yC = (-Suv * SuY + Suu * SvY) / det2;
+    // Fold the centring offset back into the constant term.
+    g.xA = mX - g.xB * mpx - g.xC * mpy;
+    g.yA = mY - g.yB * mpx - g.yC * mpy;
+    g.finalize();
+    return g.valid();
 }
 
 // XYZ tile edges in Web Mercator. x maps to longitude linearly; y maps to
@@ -152,7 +182,8 @@ bool KapChart::parse(const QString& path, KapChart& out, QString& err) {
     const auto entries = splitEntries(text);
 
     QHash<QString, QString> bsb, knp;
-    std::vector<double> refPx, refPy, refLon, refMerc;
+    // REF control points as pixel (px,py) -> Mercator metres (X,Y).
+    std::vector<double> refPx, refPy, refX, refY;
     std::vector<QPointF> plyLonLat;
     int ifm = 0;
     out.palette_.assign(256, qRgb(0, 0, 0));
@@ -181,8 +212,8 @@ bool KapChart::parse(const QString& path, KapChart& out, QString& err) {
             if (p.size() >= 5) {
                 refPx.push_back(p[1].toDouble());
                 refPy.push_back(p[2].toDouble());
-                refLon.push_back(p[4].toDouble());
-                refMerc.push_back(proj::latToY(p[3].toDouble()));
+                refX.push_back(proj::lonToX(p[4].toDouble()));
+                refY.push_back(proj::latToY(p[3].toDouble()));
             }
         } else if (tok == QLatin1String("PLY")) {
             // PLY/<n>,<lat>,<lon>
@@ -212,26 +243,22 @@ bool KapChart::parse(const QString& path, KapChart& out, QString& err) {
     out.scale_ = knp.value(QStringLiteral("SC")).toDouble();
 
     // --- projection gate -----------------------------------------------------
-    // This reader models a north-up Mercator chart and nothing else. A polyconic
-    // or skewed chart fitted with that model lands in visibly the wrong place,
-    // and a chart drawn in the wrong place is worse than a chart not drawn — so
-    // decline it and let the caller report it.
+    // This reader models a Mercator chart — including skewed (rotated) ones, which
+    // the affine georeference below handles. A genuinely different projection
+    // (polyconic, transverse Mercator, ...) fitted with a Mercator affine lands in
+    // visibly the wrong place, and a chart drawn in the wrong place is worse than a
+    // chart not drawn — so decline those and let the caller report them.
     const QString pr = knp.value(QStringLiteral("PR")).toUpper();
     if (!pr.isEmpty() && !pr.startsWith(QLatin1String("MERCATOR"))) {
         err = QStringLiteral("%1: projection %2 is not supported (Mercator only)")
                   .arg(QFileInfo(path).fileName(), pr);
         return false;
     }
-    const double skew = knp.value(QStringLiteral("SK"), QStringLiteral("0")).toDouble();
-    if (std::abs(skew) > 0.01) {
-        err = QStringLiteral("%1: skewed charts are not supported (SK=%2)")
-                  .arg(QFileInfo(path).fileName()).arg(skew);
-        return false;
-    }
 
     // --- georeference --------------------------------------------------------
-    if (!linearFit(refPx, refLon, out.georef_.lonA, out.georef_.lonB) ||
-        !linearFit(refPy, refMerc, out.georef_.mercC, out.georef_.mercD)) {
+    // One affine fit over the REF points, covering north-up and skewed charts
+    // alike (a north-up chart simply comes back with near-zero cross terms).
+    if (!affineFit(refPx, refPy, refX, refY, out.georef_)) {
         err = QStringLiteral("%1: REF points do not define a Mercator georeference")
                   .arg(QFileInfo(path).fileName());
         return false;
@@ -319,8 +346,8 @@ bool KapChart::parse(const QString& path, KapChart& out, QString& err) {
         bool coversAll = true;
         out.plyPixels_.reserve(plyLonLat.size());
         for (const QPointF& ll : plyLonLat) {
-            const double px = out.georef_.lonToPx(ll.x());
-            const double py = out.georef_.mercYToPy(proj::latToY(ll.y()));
+            double px, py;
+            out.georef_.worldToPixel(proj::lonToX(ll.x()), proj::latToY(ll.y()), px, py);
             out.plyPixels_.push_back(QPointF(px, py));
             // "Whole image" = every vertex sits on the image corner grid, within
             // a pixel of tolerance.
@@ -337,22 +364,34 @@ bool KapChart::parse(const QString& path, KapChart& out, QString& err) {
 // ---- geometry ---------------------------------------------------------------
 
 int KapChart::nativeZoom() const {
-    // At zoom z the world is 256*2^z px across 360 degrees. The chart is width_
-    // px across its own longitude span. Equating the two pixel scales:
-    //   256*2^z / 360 = width_ / lonSpan   =>   z = log2(360*width_ / (256*lonSpan))
-    const double lonSpan = std::abs(georef_.lonB) * width_;
-    if (lonSpan <= 0.0) return 0;
-    const double z = std::log2(360.0 * width_ / (256.0 * lonSpan));
+    // At zoom z the whole Mercator world (2*pi*R metres) is 256*2^z tile pixels
+    // across, so a tile pixel spans ww/(256*2^z) metres. The chart's own pixel
+    // spans metresPerPixel() metres. Equating the two scales:
+    //   ww/(256*2^z) = metresPerPixel   =>   z = log2(ww / (256*metresPerPixel))
+    const double mpp = georef_.metresPerPixel();
+    if (mpp <= 0.0) return 0;
+    const double ww = 2.0 * proj::PI * proj::kEarthRadius;
+    const double z = std::log2(ww / (256.0 * mpp));
     return std::clamp(static_cast<int>(std::lround(z)), 0, 22);
 }
 
 void KapChart::lonLatBounds(double& minLon, double& minLat,
                             double& maxLon, double& maxLat) const {
-    const double lon0 = georef_.pxToLon(0), lon1 = georef_.pxToLon(width_);
-    const double lat0 = proj::yToLat(georef_.pyToMercY(0));
-    const double lat1 = proj::yToLat(georef_.pyToMercY(height_));
-    minLon = std::min(lon0, lon1);  maxLon = std::max(lon0, lon1);
-    minLat = std::min(lat0, lat1);  maxLat = std::max(lat0, lat1);
+    // A skewed chart's raster corners aren't its lon/lat extremes along either
+    // axis, so map all four corners and take the envelope.
+    minLon = minLat = 1e30;
+    maxLon = maxLat = -1e30;
+    const double corners[4][2] = {{0, 0},
+                                  {double(width_), 0},
+                                  {double(width_), double(height_)},
+                                  {0, double(height_)}};
+    for (const auto& c : corners) {
+        double X, Y;
+        georef_.pixelToWorld(c[0], c[1], X, Y);
+        const double lon = proj::xToLon(X), lat = proj::yToLat(Y);
+        minLon = std::min(minLon, lon);  maxLon = std::max(maxLon, lon);
+        minLat = std::min(minLat, lat);  maxLat = std::max(maxLat, lat);
+    }
 }
 
 // ---- raster -----------------------------------------------------------------
@@ -365,9 +404,13 @@ void KapChart::lonLatBounds(double& minLon, double& minLat,
 // the low bits start the count, which further continuation bytes extend 7 bits
 // at a time. Note that at depth 7 the colour uses all 7 bits, so the count comes
 // entirely from continuation bytes — the shifts below handle that naturally.
-bool KapChart::readRow(QFile& f, int row, std::vector<uint8_t>& out) const {
+bool KapChart::readRow(QFile& f, int row, std::vector<uint8_t>& out, int maxCol) const {
     out.assign(width_, 0);
     if (row < 0 || row >= height_) return false;
+
+    // Decode no further than the caller needs. Columns past `lim` stay 0 and are
+    // never sampled, so we can stop the run loop as soon as we cover `lim`.
+    const int lim = std::clamp(maxCol, 1, width_);
 
     const quint32 start = rowOffsets_[row];
     const quint32 end   = rowOffsets_[row + 1];
@@ -389,7 +432,7 @@ bool KapChart::readRow(QFile& f, int row, std::vector<uint8_t>& out) const {
     const int countMask   = 0x7f >> depth_;
 
     int px = 0;
-    while (i < n && px < width_) {
+    while (i < n && px < lim) {
         uchar c = p[i++];
         if (c == 0) break;                        // end of row
         const int colour = (c & 0x7f) >> colourShift;
@@ -399,14 +442,14 @@ bool KapChart::readRow(QFile& f, int row, std::vector<uint8_t>& out) const {
             count = (count << 7) + (c & 0x7f);
         }
         ++count;
-        count = std::min(count, width_ - px);
+        count = std::min(count, lim - px);
         std::memset(out.data() + px, colour, count);
         px += count;
     }
     // Some encoders drop the trailing run when it reaches the row's end. Extend
-    // the last colour rather than leaving a stripe of index 0.
-    if (px > 0 && px < width_)
-        std::memset(out.data() + px, out[px - 1], width_ - px);
+    // the last colour rather than leaving a stripe of index 0 (only up to `lim`).
+    if (px > 0 && px < lim)
+        std::memset(out.data() + px, out[px - 1], lim - px);
     return true;
 }
 
@@ -414,33 +457,46 @@ bool KapChart::renderTile(int z, int x, int y, int tilePx,
                           QImage& img, QString& err) const {
     if (tilePx <= 0 || !georef_.valid()) return false;
 
-    // Tile bounds -> source pixel bounds. Both mappings are linear, so the tile's
-    // pixel rect is exact rather than a search.
-    const double lonL  = tileToLon(x,     z);
-    const double lonR  = tileToLon(x + 1, z);
-    const double mercT = tileToMercY(y,     z);
-    const double mercB = tileToMercY(y + 1, z);
+    // Tile edges in Mercator metres (X linear in lon, Y is mercY). A tile is an
+    // axis-aligned rectangle in this world frame; on a skewed chart it maps to a
+    // rotated quad in raster pixels, so we can no longer treat the pixel footprint
+    // as an axis-aligned rect and sample columns/rows separably.
+    const double Xl = proj::lonToX(tileToLon(x,     z));
+    const double Xr = proj::lonToX(tileToLon(x + 1, z));
+    const double Yt = tileToMercY(y,     z);
+    const double Yb = tileToMercY(y + 1, z);
 
-    const double pxL = georef_.lonToPx(lonL),   pxR = georef_.lonToPx(lonR);
-    const double pyT = georef_.mercYToPy(mercT), pyB = georef_.mercYToPy(mercB);
+    // Map the four tile corners into raster pixel space and take their bounding
+    // box: it tells us whether the tile touches the chart at all, how far to
+    // downsample, and which source rows we might read.
+    const double cornersXY[4][2] = {{Xl, Yt}, {Xr, Yt}, {Xr, Yb}, {Xl, Yb}};
+    double pxMin = 1e30, pxMax = -1e30, pyMin = 1e30, pyMax = -1e30;
+    for (const auto& c : cornersXY) {
+        double px, py;
+        georef_.worldToPixel(c[0], c[1], px, py);
+        pxMin = std::min(pxMin, px); pxMax = std::max(pxMax, px);
+        pyMin = std::min(pyMin, py); pyMax = std::max(pyMax, py);
+    }
 
     // Reject tiles that miss the chart entirely (the host caches this as absent).
-    if (std::max(pxL, pxR) <= 0 || std::min(pxL, pxR) >= width_ ||
-        std::max(pyT, pyB) <= 0 || std::min(pyT, pyB) >= height_) {
+    if (pxMax <= 0 || pxMin >= width_ || pyMax <= 0 || pyMin >= height_) {
         img = QImage();
         return true;
     }
 
-    // Downscale factor per axis: how many source pixels fall in one tile pixel.
-    // Box-average that many samples so zoomed-out charts stay legible instead of
-    // dissolving into nearest-neighbour aliasing on thin linework and text — but
-    // cap the sample count, since the cost of a tile is (row samples) x (row
-    // decodes) and a 32x downscale would otherwise decode 8192 rows.
-    constexpr int kMaxSamples = 4;
-    const double spanX = std::abs(pxR - pxL) / tilePx;
-    const double spanY = std::abs(pyB - pyT) / tilePx;
-    const int nsx = std::clamp(static_cast<int>(std::lround(spanX)), 1, kMaxSamples);
-    const int nsy = std::clamp(static_cast<int>(std::lround(spanY)), 1, kMaxSamples);
+    // Downscale factor per axis: how many source pixels fall in one tile pixel,
+    // read off the footprint's raster extent. Box-average that many sub-samples so
+    // zoomed-out charts stay legible instead of aliasing thin linework and text.
+    // The two axes are capped differently on purpose: horizontal sub-samples are
+    // just extra lookups into a row that's already decoded and in memory, but each
+    // vertical sub-sample pulls in another source row to decode — the dominant tile
+    // cost — so we spend generously across and sparingly down.
+    constexpr int kMaxSamplesX = 4;
+    constexpr int kMaxSamplesY = 2;
+    const int nsx = std::clamp(static_cast<int>(std::lround((pxMax - pxMin) / tilePx)),
+                               1, kMaxSamplesX);
+    const int nsy = std::clamp(static_cast<int>(std::lround((pyMax - pyMin) / tilePx)),
+                               1, kMaxSamplesY);
 
     QFile f(path_);
     if (!f.open(QIODevice::ReadOnly)) {
@@ -451,62 +507,66 @@ bool KapChart::renderTile(int z, int x, int y, int tilePx,
     img = QImage(tilePx, tilePx, QImage::Format_ARGB32);
     img.fill(Qt::transparent);
 
-    // Column sample table: for each destination column, the source columns to
-    // average. Built once and reused for every row of the tile.
-    std::vector<std::array<int, kMaxSamples>> colSamples(tilePx);
-    std::vector<int> colCount(tilePx, 0);
-    for (int i = 0; i < tilePx; ++i) {
-        for (int s = 0; s < nsx; ++s) {
-            const double t  = (i + (s + 0.5) / nsx) / tilePx;
-            const double sx = pxL + (pxR - pxL) * t;
-            const int    cx = static_cast<int>(std::floor(sx));
-            if (cx < 0 || cx >= width_) continue;
-            colSamples[i][colCount[i]++] = cx;
+    // Decode source rows lazily and once each: the footprint's rotated quad can
+    // touch any row in [r0, r1], and neighbouring sub-samples hit the same rows
+    // repeatedly. Rows outside the chart never allocate.
+    const int r0 = std::max(0, static_cast<int>(std::floor(pyMin)));
+    const int r1 = std::min(height_ - 1, static_cast<int>(std::ceil(pyMax)));
+    if (r1 < r0) { img = QImage(); return true; }
+    const int maxCol = std::clamp(static_cast<int>(std::ceil(pxMax)) + 1, 1, width_);
+    std::vector<std::vector<uint8_t>> rows(r1 - r0 + 1);
+    std::vector<char> loaded(r1 - r0 + 1, 0);
+    auto rowFor = [&](int ry) -> const std::vector<uint8_t>* {
+        if (ry < r0 || ry > r1) return nullptr;
+        const int k = ry - r0;
+        if (!loaded[k]) {
+            loaded[k] = 1;
+            if (!readRow(f, ry, rows[k], maxCol)) rows[k].clear();
         }
-    }
+        return rows[k].empty() ? nullptr : &rows[k];
+    };
 
-    std::vector<uint8_t> rowBuf;
-    // Accumulators for one destination row.
-    std::vector<int> accR(tilePx), accG(tilePx), accB(tilePx), accA(tilePx), accN(tilePx);
-
+    const bool havePly = !plyPixels_.empty();
     bool any = false;
     for (int j = 0; j < tilePx; ++j) {
-        std::fill(accR.begin(), accR.end(), 0);
-        std::fill(accG.begin(), accG.end(), 0);
-        std::fill(accB.begin(), accB.end(), 0);
-        std::fill(accA.begin(), accA.end(), 0);
-        std::fill(accN.begin(), accN.end(), 0);
-
-        for (int s = 0; s < nsy; ++s) {
-            const double t  = (j + (s + 0.5) / nsy) / tilePx;
-            const double sy = pyT + (pyB - pyT) * t;
-            const int    ry = static_cast<int>(std::floor(sy));
-            if (ry < 0 || ry >= height_) continue;
-            if (!readRow(f, ry, rowBuf)) continue;
-
-            for (int i = 0; i < tilePx; ++i) {
-                for (int c = 0; c < colCount[i]; ++c) {
-                    const int cx = colSamples[i][c];
-                    // Outside the chart's real coverage (paper collar / legend on
-                    // a scanned chart): contribute nothing, so neighbours quilt
-                    // without a border overlapping them.
-                    if (!plyPixels_.empty() &&
-                        !pointInPolygon(plyPixels_, cx + 0.5, ry + 0.5))
-                        continue;
-                    const QRgb v = palette_[rowBuf[cx]];
-                    accR[i] += qRed(v); accG[i] += qGreen(v);
-                    accB[i] += qBlue(v); accA[i] += qAlpha(v);
-                    ++accN[i];
-                }
-            }
-        }
-
         QRgb* line = reinterpret_cast<QRgb*>(img.scanLine(j));
         for (int i = 0; i < tilePx; ++i) {
-            if (!accN[i]) continue;                 // stays transparent
-            const int n = accN[i];
-            line[i] = qRgba(accR[i] / n, accG[i] / n, accB[i] / n, accA[i] / n);
-            any = true;
+            // Coverage test once per output pixel (at its centre), not per
+            // sub-sample: the paper collar / legend on a scanned chart is clipped
+            // so neighbours quilt without an overlapping border, and testing the
+            // polygon 16x per pixel was the dominant cost when downsampling. The
+            // resulting collar edge is hard to within one output pixel, which is
+            // exactly where charts abut anyway.
+            if (havePly) {
+                double px, py;
+                georef_.worldToPixel(Xl + (Xr - Xl) * ((i + 0.5) / tilePx),
+                                     Yt + (Yb - Yt) * ((j + 0.5) / tilePx), px, py);
+                if (!pointInPolygon(plyPixels_, px, py)) continue;
+            }
+
+            int aR = 0, aG = 0, aB = 0, aA = 0, aN = 0;
+            for (int sy = 0; sy < nsy; ++sy) {
+                const double Y = Yt + (Yb - Yt) * ((j + (sy + 0.5) / nsy) / tilePx);
+                for (int sx = 0; sx < nsx; ++sx) {
+                    const double X = Xl + (Xr - Xl) * ((i + (sx + 0.5) / nsx) / tilePx);
+
+                    double px, py;
+                    georef_.worldToPixel(X, Y, px, py);
+                    const int cx = static_cast<int>(std::floor(px));
+                    const int ry = static_cast<int>(std::floor(py));
+                    if (cx < 0 || cx >= width_ || ry < 0 || ry >= height_) continue;
+                    const std::vector<uint8_t>* row = rowFor(ry);
+                    if (!row) continue;
+                    const QRgb v = palette_[(*row)[cx]];
+                    aR += qRed(v); aG += qGreen(v);
+                    aB += qBlue(v); aA += qAlpha(v);
+                    ++aN;
+                }
+            }
+            if (aN) {
+                line[i] = qRgba(aR / aN, aG / aN, aB / aN, aA / aN);
+                any = true;
+            }
         }
     }
 

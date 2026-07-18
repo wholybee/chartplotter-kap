@@ -61,7 +61,13 @@ int main(int argc, char** argv) {
         return 2;
     }
     const QString root = QString::fromLocal8Bit(argv[1]);
-    const QString outDir = argc > 2 ? QString::fromLocal8Bit(argv[2]) : QDir::currentPath();
+    bool bench = false;
+    QString outDir = QDir::currentPath();
+    for (int i = 2; i < argc; ++i) {
+        const QString a = QString::fromLocal8Bit(argv[i]);
+        if (a == QStringLiteral("bench")) bench = true;
+        else outDir = a;
+    }
 
     QStringList paths;
     QDirIterator it(root, {QStringLiteral("*.kap"), QStringLiteral("*.KAP")},
@@ -107,10 +113,16 @@ int main(int argc, char** argv) {
         const KapGeoref& g = c.georef();
         check(g.valid(), c.name() + QStringLiteral(": georeference not valid"));
 
-        // Round-trip: pixel -> lon -> pixel must land back on the same pixel.
-        const double rt = g.lonToPx(g.pxToLon(c.width() / 2.0));
-        check(std::abs(rt - c.width() / 2.0) < 1e-6,
-              c.name() + QStringLiteral(": lon round-trip drifted"));
+        // Round-trip: pixel -> world -> pixel must land back on the same pixel.
+        // Use an off-centre point so a bug in either cross term (skew) shows up.
+        {
+            const double px0 = c.width() / 3.0, py0 = c.height() / 4.0;
+            double X, Y, px1, py1;
+            g.pixelToWorld(px0, py0, X, Y);
+            g.worldToPixel(X, Y, px1, py1);
+            check(std::abs(px1 - px0) < 1e-3 && std::abs(py1 - py0) < 1e-3,
+                  c.name() + QStringLiteral(": pixel<->world round-trip drifted"));
+        }
 
         check(c.width() > 0 && c.height() > 0,
               c.name() + QStringLiteral(": bad raster size"));
@@ -121,17 +133,61 @@ int main(int argc, char** argv) {
         const int z = c.nativeZoom();
         check(z > 0 && z <= 22, c.name() + QStringLiteral(": implausible native zoom"));
 
-        // At native zoom one chart pixel should equal one tile pixel. Check the
-        // chart's width in tile-pixels matches its raster width.
-        const double tw = (lonToTile(maxLon, z) - lonToTile(minLon, z)) * 256.0;
-        check(std::abs(tw - c.width()) < 2.0,
-              QStringLiteral("%1: native zoom %2 gives %3 tile px for a %4 px raster")
-                  .arg(c.name()).arg(z).arg(tw, 0, 'f', 1).arg(c.width()));
+        // Native zoom should reproduce the chart's own pixel scale to within the
+        // rounding of z to an integer (a scanned chart's scale is rarely an exact
+        // power of two, so the tile pixel can differ by up to a factor of sqrt(2)).
+        const double ww = 2.0 * proj::PI * proj::kEarthRadius;
+        const double tileMpp = ww / (256.0 * std::pow(2.0, z));
+        const double ratio = tileMpp / g.metresPerPixel();
+        check(ratio > 0.70 && ratio < 1.43,
+              QStringLiteral("%1: native zoom %2 off by %3x from raster scale")
+                  .arg(c.name()).arg(z).arg(ratio, 0, 'f', 2));
     }
     out << QStringLiteral("coverage: lon %1..%2  lat %3..%4")
                .arg(gMinLon, 0, 'f', 4).arg(gMaxLon, 0, 'f', 4)
                .arg(gMinLat, 0, 'f', 4).arg(gMaxLat, 0, 'f', 4)
         << Qt::endl;
+
+    // ---- render benchmark (simulate host tile requests) ---------------------
+    if (bench) {
+        const KapChart& c = *std::max_element(
+            charts.begin(), charts.end(),
+            [](const KapChart& a, const KapChart& b) {
+                return a.nativeZoom() < b.nativeZoom();
+            });
+        const int zN = c.nativeZoom();
+        double minLon, minLat, maxLon, maxLat;
+        c.lonLatBounds(minLon, minLat, maxLon, maxLat);
+        const double cLon = (minLon + maxLon) / 2.0, cLat = (minLat + maxLat) / 2.0;
+        out << "bench: '" << c.name() << "' " << c.width() << "x" << c.height()
+            << " nativeZoom=" << zN << Qt::endl;
+        // A 6x6 block of tiles over the chart centre, at several zooms below native
+        // (what the host asks for as you zoom in/out over this chart).
+        for (int dz : {0, 2, 4, 6, 8}) {
+            const int z = zN - dz;
+            if (z < 0) continue;
+            const int cx = static_cast<int>(std::floor(lonToTile(cLon, z)));
+            const int cy = static_cast<int>(std::floor(latToTile(cLat, z)));
+            QElapsedTimer t; t.start();
+            int drawn = 0;
+            qint64 worst = 0;
+            for (int ty = cy - 3; ty < cy + 3; ++ty) {
+                for (int tx = cx - 3; tx < cx + 3; ++tx) {
+                    QImage img; QString err;
+                    QElapsedTimer tt; tt.start();
+                    c.renderTile(z, tx, ty, 256, img, err);
+                    worst = std::max(worst, tt.nsecsElapsed());
+                    if (!img.isNull()) ++drawn;
+                }
+            }
+            const double ms = t.elapsed();
+            out << "  z=" << z << " (native-" << dz << "): " << drawn
+                << "/36 tiles drawn in " << ms << " ms  ("
+                << QString::number(ms / 36.0, 'f', 1) << " ms/tile avg, worst "
+                << QString::number(worst / 1e6, 'f', 1) << " ms)" << Qt::endl;
+        }
+        return 0;
+    }
 
     // ---- one native-zoom tile ----------------------------------------------
     // Render from the most detailed chart in the set (largest native zoom =
@@ -146,9 +202,10 @@ int main(int argc, char** argv) {
         const int z = c.nativeZoom();
         double minLon, minLat, maxLon, maxLat;
         c.lonLatBounds(minLon, minLat, maxLon, maxLat);
-        // A tile comfortably inside the chart.
-        const int tx = static_cast<int>(std::floor(lonToTile(minLon, z))) + 1;
-        const int ty = static_cast<int>(std::floor(latToTile(maxLat, z))) + 1;
+        // The tile over the chart's centre — guaranteed on-chart even for a skewed
+        // chart, whose corners fall outside its own lon/lat envelope.
+        const int tx = static_cast<int>(std::floor(lonToTile((minLon + maxLon) / 2.0, z)));
+        const int ty = static_cast<int>(std::floor(latToTile((minLat + maxLat) / 2.0, z)));
 
         QImage img;
         QString err;

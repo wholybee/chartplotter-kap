@@ -31,14 +31,18 @@ than the tiles currently on screen.
 
 ## Requirements & limitations
 
-- **Mercator, north-up charts only.** `KNP/PR` must be `MERCATOR` and `KNP/SK`
-  (skew) must be ~0. Polyconic or rotated charts are **declined with a message
-  rather than drawn**: this reader models a chart whose longitude is linear in x
-  and whose *projected* Mercator y is linear in y, and fitting that model to a
-  chart it doesn't describe would place the chart in visibly the wrong position.
-  A chart drawn in the wrong place is worse than a chart not drawn.
-- Charts that are declined are skipped individually; one bad chart never sinks
-  the folder.
+- **Mercator charts, including skewed (rotated) ones.** `KNP/PR` must be
+  `MERCATOR`; the skew angle (`KNP/SK`) may be anything. NOAA rotates most of its
+  approach and harbour charts to run a channel or coastline up the page, so this
+  matters — nearly half of a NOAA RNC set is skewed. The georeference is a
+  least-squares **affine** fit of the `REF` control points from raster pixels to
+  projected Mercator metres, which places a rotated chart exactly and collapses to
+  the north-up case on its own when the chart isn't rotated.
+- **Non-Mercator projections are declined**, not drawn. `POLYCONIC` and the like
+  need a different model, and fitting a Mercator affine to one would place it in
+  visibly the wrong position — a chart drawn in the wrong place is worse than a
+  chart not drawn. Declined charts are skipped individually; one never sinks the
+  folder.
 - **Charts crossing the 180° antimeridian are not handled.** The georeference is
   a linear fit of longitude against x, and `REF` points either side of the seam
   (179 → −179) are discontinuous, so the fit would be wrong. Untested — no such

@@ -8,7 +8,7 @@
 # This plugin is GPL-2.0-or-later; the host application remains under its own
 # LGPL-2.1 licence. See COPYING.
 cmake_minimum_required(VERSION 3.21)
-project(chartplotter_kap_plugin VERSION 1.0.0 LANGUAGES CXX)
+project(chartplotter_kap_plugin VERSION 1.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
